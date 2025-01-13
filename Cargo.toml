@@ -1,0 +1,10 @@
+[package]
+name = "bevy_ecs_natural_selection"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = "0.15.1"
+bevy_ecs = "0.15.1"
+bevy_egui = "0.32.0"
+rand = "0.8.5"
