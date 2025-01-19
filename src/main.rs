@@ -113,10 +113,7 @@ fn setup_simulation(
     });
 }
 
-// --- PREY -------------------------------------------------------------------
-#[derive(Component, Debug, Reflect)]
-struct Prey;
-
+// --- Animals ----------------------------------------------------------------
 #[derive(Component, Debug, Reflect)]
 struct Motion {
     direction: Vec2,
@@ -137,6 +134,9 @@ enum MotionBehavior {
     Wander,
 }
 
+#[derive(Component, Debug, Reflect)]
+struct Behaves;
+
 #[derive(Event)]
 struct PreySpawnEvent {
     x: i32,
@@ -145,8 +145,8 @@ struct PreySpawnEvent {
 
 fn create_prey(commands: &mut Commands, x: i32, y: i32) {
     commands.spawn((
-        Prey,
         EntityKind::Prey,
+        Behaves,
         Energy { value: 20.0 },
         Diet {
             eats: vec![EntityKind::Plant],
@@ -209,7 +209,7 @@ fn vision_system(
 }
 
 fn animal_behaviour_system(
-    query: Query<(Entity, &Vision, &Diet), With<Prey>>,
+    query: Query<(Entity, &Vision, &Diet), With<Behaves>>,
     mut intent_events: EventWriter<IntentEvent>,
 ) {
     for (entity, vision, diet) in query.iter() {
@@ -283,8 +283,6 @@ fn handle_collisions(
     mut query: Query<(&EntityKind, &Diet, &Edible, &mut Energy)>,
 ) {
     for CollisionEvent(entity_a, entity_b) in collisions.read() {
-        println!("Collision between {:?} and {:?}", entity_a, entity_b);
-        // Get just the values we need to check first
         let (nutrition_a, nutrition_b, can_a_eat_b, can_b_eat_a) =
             match (query.get(*entity_a), query.get(*entity_b)) {
                 (Ok(a), Ok(b)) => (
@@ -340,7 +338,7 @@ fn movement_system(
         match behavior {
             MotionBehavior::Wander => {
                 if rng.gen::<f32>() < 0.1 {
-                    let angle = rng.gen::<f32>() * std::f32::consts::PI * 0.2 * 2.78; // max turn 100º
+                    let angle = rng.gen::<f32>() * std::f32::consts::TAU; // Full 360° rotation
                     let change = Vec2::new(angle.cos(), angle.sin());
                     motion.direction = (motion.direction + change * 0.1).normalize();
                 }
@@ -384,7 +382,7 @@ struct PlantSpawnEvent {
 }
 
 // Growth parameters.
-const GROWTH_CHANCE_PER_SECOND: f32 = 2.0; // Increased chance
+const GROWTH_CHANCE_PER_SECOND: f32 = 1.4; // Increased chance
 const CARDINAL_WEIGHT: f32 = 0.9; // 80% chance for cardinal directions
 
 // Sizing.
