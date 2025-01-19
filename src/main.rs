@@ -12,7 +12,6 @@ fn main() {
                 SimulationSet::Perception,
                 SimulationSet::Decisions,
                 SimulationSet::Actions,
-                SimulationSet::Resolution,
             )
                 .chain(),
         )
@@ -28,9 +27,18 @@ fn main() {
             Update,
             (
                 vision_system.in_set(SimulationSet::Perception),
-                prey_decision_system.in_set(SimulationSet::Decisions),
+                animal_behaviour_system.in_set(SimulationSet::Decisions),
                 handle_intent_system.in_set(SimulationSet::Decisions),
                 movement_system.in_set(SimulationSet::Actions),
+            ),
+        )
+        // Add to main systems
+        .add_event::<CollisionEvent>()
+        .add_systems(
+            Update,
+            (
+                check_collisions.in_set(SimulationSet::Perception),
+                handle_collisions.in_set(SimulationSet::Actions),
             ),
         )
         .run();
@@ -41,7 +49,6 @@ enum SimulationSet {
     Perception,
     Decisions,
     Actions,
-    Resolution,
 }
 
 #[derive(Component, Debug, Reflect)]
@@ -54,17 +61,22 @@ struct Position {
 struct Energy {
     value: f32,
 }
-#[derive(Component, Debug)]
-struct Vision {
-    range: f32,                                       // Vision radius in grid units.
-    visible_entities: Vec<(Entity, EntityType, f32)>, // Entity, type, distance
+
+#[derive(Component, Debug, Reflect, Eq, PartialEq, Copy, Clone)]
+enum EntityKind {
+    Plant,
+    Prey,
+    Predator,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum EntityType {
-    Food,
-    Threat,
-    PotentialMate,
+#[derive(Component, Debug, Reflect)]
+struct Edible {
+    nutrition: f32,
+}
+
+#[derive(Component, Debug, Reflect)]
+struct Diet {
+    eats: Vec<EntityKind>,
 }
 
 // --- SETUP ------------------------------------------------------------------
@@ -134,7 +146,12 @@ struct PreySpawnEvent {
 fn create_prey(commands: &mut Commands, x: i32, y: i32) {
     commands.spawn((
         Prey,
+        EntityKind::Prey,
         Energy { value: 20.0 },
+        Diet {
+            eats: vec![EntityKind::Plant],
+        },
+        Edible { nutrition: 20.0 },
         Position { x, y },
         Motion {
             direction: Vec2::ZERO,
@@ -160,41 +177,48 @@ fn handle_prey_spawn(mut commands: Commands, mut event_reader: EventReader<PreyS
     }
 }
 
+// --- VISION -----------------------------------------------------------------
+#[derive(Component, Debug)]
+struct Vision {
+    range: f32,                                       // Vision radius in grid units.
+    visible_entities: Vec<(Entity, EntityKind, f32)>, // Entity, type, distance
+}
+
 fn vision_system(
-    mut creatures: Query<(&Position, &mut Vision)>,
-    plants: Query<(Entity, &Position), With<Plant>>,
+    mut creatures: Query<(&Position, &mut Vision, &Diet)>,
+    entities: Query<(Entity, &Position, &EntityKind, Option<&Edible>)>,
 ) {
-    for (pos, mut vision) in creatures.iter_mut() {
+    for (pos, mut vision, diet) in creatures.iter_mut() {
         vision.visible_entities.clear();
 
-        for (plant_entity, plant_pos) in plants.iter() {
-            let dx = pos.x - plant_pos.x;
-            let dy = pos.y - plant_pos.y;
+        for (entity, other_pos, kind, edible) in entities.iter() {
+            let dx = pos.x - other_pos.x;
+            let dy = pos.y - other_pos.y;
             let dist_sq = dx * dx + dy * dy;
             let range_sq = (vision.range * vision.range) as i32;
 
             if dist_sq < range_sq {
-                vision.visible_entities.push((
-                    plant_entity,
-                    EntityType::Food,
-                    (dist_sq as f32).sqrt(),
-                ));
+                if diet.eats.contains(kind) && edible.is_some() {
+                    vision
+                        .visible_entities
+                        .push((entity, *kind, (dist_sq as f32).sqrt()));
+                }
             }
         }
     }
 }
 
-fn prey_decision_system(
-    query: Query<(Entity, &Vision), With<Prey>>,
+fn animal_behaviour_system(
+    query: Query<(Entity, &Vision, &Diet), With<Prey>>,
     mut intent_events: EventWriter<IntentEvent>,
 ) {
-    for (entity, vision) in query.iter() {
+    for (entity, vision, diet) in query.iter() {
         if !vision.visible_entities.is_empty() {
             // Find closest food entity
             let closest_food = vision
                 .visible_entities
                 .iter()
-                .filter(|(_, entity_type, _)| matches!(entity_type, EntityType::Food))
+                .filter(|(_, kind, _)| diet.eats.contains(kind))
                 .next();
 
             if let Some((food_entity, _, _)) = closest_food {
@@ -231,7 +255,64 @@ fn handle_intent_system(
     }
 }
 
-// --- ANIMAL SYSTEMS --------------------------------------------------------
+// --- PHYSICAL SYSTEMS -------------------------------------------------------
+// - Add energy drain.
+
+#[derive(Event)]
+struct CollisionEvent(Entity, Entity); // (entity_a, entity_b)
+
+// Simple collision detection
+fn check_collisions(
+    positions: Query<(Entity, &Position, &EntityKind)>,
+    mut collision_events: EventWriter<CollisionEvent>,
+) {
+    let entities: Vec<_> = positions.iter().collect();
+
+    for (i, (entity_a, pos_a, _)) in entities.iter().enumerate() {
+        for (entity_b, pos_b, _) in entities[i + 1..].iter() {
+            if pos_a.x == pos_b.x && pos_a.y == pos_b.y {
+                collision_events.send(CollisionEvent(*entity_a, *entity_b));
+            }
+        }
+    }
+}
+
+fn handle_collisions(
+    mut collision_events: EventReader<CollisionEvent>,
+    mut commands: Commands,
+    mut query: Query<(&EntityKind, &Diet, &Edible, &mut Energy)>,
+) {
+    for CollisionEvent(entity_a, entity_b) in collision_events.read() {
+        let nutrition_a;
+        let nutrition_b;
+        let can_a_eat_b;
+        let can_b_eat_a;
+
+        // First pass - get nutritional values and eating capabilities
+        if let (Ok(a), Ok(b)) = (query.get(*entity_a), query.get(*entity_b)) {
+            nutrition_a = a.2.nutrition;
+            nutrition_b = b.2.nutrition;
+            can_a_eat_b = a.1.eats.contains(b.0);
+            can_b_eat_a = b.1.eats.contains(a.0);
+        } else {
+            continue;
+        }
+
+        // Second pass - handle eating
+        if can_a_eat_b {
+            if let Ok(mut energy) = query.get_mut(*entity_a) {
+                energy.3.value += nutrition_b;
+                commands.entity(*entity_b).despawn();
+            }
+        } else if can_b_eat_a {
+            if let Ok(mut energy) = query.get_mut(*entity_b) {
+                energy.3.value += nutrition_a;
+                commands.entity(*entity_a).despawn();
+            }
+        }
+    }
+}
+
 fn movement_system(
     mut param_set: ParamSet<(
         Query<(&MotionBehavior, &mut Motion, &mut Transform, &mut Position)>,
@@ -313,6 +394,8 @@ fn create_plant(commands: &mut Commands, x: i32, y: i32) {
             custom_size: Some(Vec2::new(PLANT_SIZE, PLANT_SIZE)),
             ..default()
         },
+        EntityKind::Plant,
+        Edible { nutrition: 5.0 },
         Transform::from_xyz(x as f32 * PLANT_GAP, y as f32 * PLANT_GAP, 0.0),
     ));
 }
