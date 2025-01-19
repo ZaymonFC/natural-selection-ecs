@@ -108,7 +108,7 @@ fn setup_simulation(
         plant_events.send(PlantSpawnEvent { x, y });
     });
 
-    random_screen_positions().take(5).for_each(|(x, y)| {
+    random_screen_positions().take(100).for_each(|(x, y)| {
         prey_events.send(PreySpawnEvent { x, y });
     });
 }
@@ -278,38 +278,46 @@ fn check_collisions(
 }
 
 fn handle_collisions(
-    mut collision_events: EventReader<CollisionEvent>,
+    mut collisions: EventReader<CollisionEvent>,
     mut commands: Commands,
     mut query: Query<(&EntityKind, &Diet, &Edible, &mut Energy)>,
 ) {
-    for CollisionEvent(entity_a, entity_b) in collision_events.read() {
-        let nutrition_a;
-        let nutrition_b;
-        let can_a_eat_b;
-        let can_b_eat_a;
+    for CollisionEvent(entity_a, entity_b) in collisions.read() {
+        println!("Collision between {:?} and {:?}", entity_a, entity_b);
+        // Get just the values we need to check first
+        let (nutrition_a, nutrition_b, can_a_eat_b, can_b_eat_a) =
+            match (query.get(*entity_a), query.get(*entity_b)) {
+                (Ok(a), Ok(b)) => (
+                    a.2.nutrition,
+                    b.2.nutrition,
+                    a.1.eats.contains(b.0),
+                    b.1.eats.contains(a.0),
+                ),
+                _ => continue,
+            };
 
-        // First pass - get nutritional values and eating capabilities
-        if let (Ok(a), Ok(b)) = (query.get(*entity_a), query.get(*entity_b)) {
-            nutrition_a = a.2.nutrition;
-            nutrition_b = b.2.nutrition;
-            can_a_eat_b = a.1.eats.contains(b.0);
-            can_b_eat_a = b.1.eats.contains(a.0);
-        } else {
-            continue;
-        }
-
-        // Second pass - handle eating
         if can_a_eat_b {
-            if let Ok(mut energy) = query.get_mut(*entity_a) {
-                energy.3.value += nutrition_b;
-                commands.entity(*entity_b).despawn();
-            }
+            eat(&mut commands, &mut query, *entity_a, *entity_b, nutrition_b);
         } else if can_b_eat_a {
-            if let Ok(mut energy) = query.get_mut(*entity_b) {
-                energy.3.value += nutrition_a;
-                commands.entity(*entity_a).despawn();
-            }
+            eat(&mut commands, &mut query, *entity_b, *entity_a, nutrition_a);
         }
+    }
+}
+
+fn eat(
+    commands: &mut Commands,
+    query: &mut Query<(&EntityKind, &Diet, &Edible, &mut Energy)>,
+    eater: Entity,
+    eaten: Entity,
+    nutrition: f32,
+) {
+    if let Ok(mut eater_energy) = query.get_mut(eater) {
+        println!(
+            "Entity {:?} ate entity {:?} for {} energy",
+            eater, eaten, nutrition
+        );
+        eater_energy.3.value += nutrition;
+        commands.entity(eaten).despawn();
     }
 }
 
@@ -395,6 +403,7 @@ fn create_plant(commands: &mut Commands, x: i32, y: i32) {
             ..default()
         },
         EntityKind::Plant,
+        Diet { eats: vec![] },
         Edible { nutrition: 5.0 },
         Transform::from_xyz(x as f32 * PLANT_GAP, y as f32 * PLANT_GAP, 0.0),
     ));
