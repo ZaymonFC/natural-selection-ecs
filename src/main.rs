@@ -22,12 +22,14 @@ fn main() {
         .add_systems(Update, handle_plant_spawn)
         // Prey systems
         .add_event::<PreySpawnEvent>()
+        .add_event::<IntentEvent>()
         .add_systems(Update, handle_prey_spawn)
         .add_systems(
             Update,
             (
                 vision_system.in_set(SimulationSet::Perception),
                 prey_decision_system.in_set(SimulationSet::Decisions),
+                handle_intent_system.in_set(SimulationSet::Decisions),
                 movement_system.in_set(SimulationSet::Actions),
             ),
         )
@@ -52,10 +54,10 @@ struct Position {
 struct Energy {
     value: f32,
 }
-
 #[derive(Component, Debug)]
 struct Vision {
-    visible_entities: Vec<(Entity, EntityType)>,
+    range: f32,                                       // Vision radius in grid units.
+    visible_entities: Vec<(Entity, EntityType, f32)>, // Entity, type, distance
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,11 +111,18 @@ struct Motion {
     speed: f32,
 }
 
+#[derive(Event)]
+enum IntentEvent {
+    Eat(Entity, Entity),    // (prey_entity, target_entity)
+    Explore(Entity),        // prey_entity
+    Escape(Entity, Entity), // (prey_entity, threat_entity)
+}
+
 #[derive(Component, Debug, Reflect)]
-enum Intent {
+enum MotionBehavior {
+    Seek { target: Entity },
+    Evade { target: Entity },
     Wander,
-    SeekFood { target: Vec2 },
-    Flee { from: Vec2 },
 }
 
 #[derive(Event)]
@@ -132,8 +141,10 @@ fn create_prey(commands: &mut Commands, x: i32, y: i32) {
             speed: 50.0,
         },
         Vision {
+            range: 10.0,
             visible_entities: Vec::new(),
         },
+        MotionBehavior::Wander,
         Sprite {
             color: Color::srgb(0.0, 0.0, 1.0),
             custom_size: Some(Vec2::new(PLANT_SIZE * 1.2, PLANT_SIZE * 1.2)),
@@ -159,48 +170,108 @@ fn vision_system(
         for (plant_entity, plant_pos) in plants.iter() {
             let dx = pos.x - plant_pos.x;
             let dy = pos.y - plant_pos.y;
-            if dx * dx + dy * dy < 25 {
-                // 5 unit vision radius
-                vision
-                    .visible_entities
-                    .push((plant_entity, EntityType::Food));
+            let dist_sq = dx * dx + dy * dy;
+            let range_sq = (vision.range * vision.range) as i32;
+
+            if dist_sq < range_sq {
+                vision.visible_entities.push((
+                    plant_entity,
+                    EntityType::Food,
+                    (dist_sq as f32).sqrt(),
+                ));
             }
         }
     }
 }
 
 fn prey_decision_system(
-    mut commands: Commands,
-    query: Query<(Entity, &Vision), (With<Prey>, Without<Intent>)>,
+    query: Query<(Entity, &Vision), With<Prey>>,
+    mut intent_events: EventWriter<IntentEvent>,
 ) {
     for (entity, vision) in query.iter() {
-        if let Some((_, EntityType::Food)) = vision.visible_entities.first() {
-            commands.entity(entity).insert(Intent::Wander);
-        } else {
-            commands.entity(entity).insert(Intent::Wander);
+        if !vision.visible_entities.is_empty() {
+            // Find closest food entity
+            let closest_food = vision
+                .visible_entities
+                .iter()
+                .filter(|(_, entity_type, _)| matches!(entity_type, EntityType::Food))
+                .next();
+
+            if let Some((food_entity, _, _)) = closest_food {
+                intent_events.send(IntentEvent::Eat(entity, *food_entity));
+                continue;
+            }
+        }
+        intent_events.send(IntentEvent::Explore(entity));
+    }
+}
+
+fn handle_intent_system(
+    mut intents: EventReader<IntentEvent>,
+    mut entities: Query<&mut MotionBehavior>,
+) {
+    for intent in intents.read() {
+        match intent {
+            IntentEvent::Eat(entity, target) => {
+                if let Ok(mut behavior) = entities.get_mut(*entity) {
+                    *behavior = MotionBehavior::Seek { target: *target };
+                }
+            }
+            IntentEvent::Explore(entity) => {
+                if let Ok(mut behavior) = entities.get_mut(*entity) {
+                    *behavior = MotionBehavior::Wander;
+                }
+            }
+            IntentEvent::Escape(entity, threat) => {
+                if let Ok(mut behavior) = entities.get_mut(*entity) {
+                    *behavior = MotionBehavior::Evade { target: *threat };
+                }
+            }
         }
     }
 }
 
+// --- ANIMAL SYSTEMS --------------------------------------------------------
 fn movement_system(
-    mut query: Query<(&Intent, &mut Motion, &mut Transform, &mut Position)>,
+    mut param_set: ParamSet<(
+        Query<(&MotionBehavior, &mut Motion, &mut Transform, &mut Position)>,
+        Query<(Entity, &Position)>,
+    )>,
     time: Res<Time>,
 ) {
     let mut rng = rand::thread_rng();
 
-    for (intent, mut motion, mut transform, mut position) in query.iter_mut() {
-        match intent {
-            Intent::Wander => {
+    let positions: Vec<(Entity, Position)> = param_set
+        .p1()
+        .iter()
+        .map(|(e, p)| (e, Position { x: p.x, y: p.y }))
+        .collect();
+
+    for (behavior, mut motion, mut transform, mut position) in param_set.p0().iter_mut() {
+        match behavior {
+            MotionBehavior::Wander => {
                 if rng.gen::<f32>() < 0.1 {
-                    let angle = rng.gen::<f32>() * std::f32::consts::TAU;
-                    motion.direction = Vec2::new(angle.cos(), angle.sin());
+                    let angle = rng.gen::<f32>() * std::f32::consts::PI * 0.2 * 2.78; // max turn 100º
+                    let change = Vec2::new(angle.cos(), angle.sin());
+                    motion.direction = (motion.direction + change * 0.1).normalize();
                 }
             }
-            Intent::SeekFood { target: _ } => {
-                // Will implement later
+            MotionBehavior::Seek { target } => {
+                if let Some((_, target_pos)) = positions.iter().find(|(e, _)| e == target) {
+                    let dx = target_pos.x - position.x;
+                    let dy = target_pos.y - position.y;
+                    let dir = Vec2::new(dx as f32, dy as f32);
+                    if dir != Vec2::ZERO {
+                        motion.direction = dir.normalize();
+                    }
+                }
             }
-            Intent::Flee { from: _ } => {
-                // Will implement later
+            MotionBehavior::Evade { target } => {
+                if let Some((_, target_pos)) = positions.iter().find(|(e, _)| e == target) {
+                    let dx = position.x - target_pos.x;
+                    let dy = position.y - target_pos.y;
+                    motion.direction = Vec2::new(dx as f32, dy as f32).normalize();
+                }
             }
         }
 
@@ -231,6 +302,7 @@ const CARDINAL_WEIGHT: f32 = 0.9; // 80% chance for cardinal directions
 const PLANT_SIZE: f32 = 5.0;
 const PLANT_GAP: f32 = 6.0;
 
+// -- Creation.
 fn create_plant(commands: &mut Commands, x: i32, y: i32) {
     commands.spawn((
         Plant,
@@ -250,6 +322,8 @@ fn handle_plant_spawn(mut commands: Commands, mut event_reader: EventReader<Plan
         create_plant(&mut commands, event.x, event.y);
     }
 }
+
+// -- Systems.
 fn plant_growth(
     plants: Query<&Position, With<Plant>>,
     mut events: EventWriter<PlantSpawnEvent>,
