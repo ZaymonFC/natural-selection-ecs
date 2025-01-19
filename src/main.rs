@@ -9,19 +9,34 @@ fn main() {
         .configure_sets(
             Update,
             (
+                SimulationSet::Perception,
                 SimulationSet::Decisions,
                 SimulationSet::Actions,
                 SimulationSet::Resolution,
             )
                 .chain(),
         )
-        .add_systems(Update, plant_growth)
+        // Plant systems
+        .add_systems(Update, plant_growth.in_set(SimulationSet::Actions))
+        .add_event::<PlantSpawnEvent>()
+        .add_systems(Update, handle_plant_spawn)
+        // Prey systems
+        .add_event::<PreySpawnEvent>()
+        .add_systems(Update, handle_prey_spawn)
+        .add_systems(
+            Update,
+            (
+                vision_system.in_set(SimulationSet::Perception),
+                prey_decision_system.in_set(SimulationSet::Decisions),
+                movement_system.in_set(SimulationSet::Actions),
+            ),
+        )
         .run();
 }
 
-// Define our simulation stages
 #[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
 enum SimulationSet {
+    Perception,
     Decisions,
     Actions,
     Resolution,
@@ -38,21 +53,181 @@ struct Energy {
     value: f32,
 }
 
+#[derive(Component, Debug)]
+struct Vision {
+    visible_entities: Vec<(Entity, EntityType)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EntityType {
+    Food,
+    Threat,
+    PotentialMate,
+}
+
 // --- SETUP ------------------------------------------------------------------
 fn setup_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
 }
 
-fn setup_simulation(mut commands: Commands) {
-    create_plant(&mut commands, 0, 0);
+fn setup_simulation(
+    mut plant_events: EventWriter<PlantSpawnEvent>,
+    mut prey_events: EventWriter<PreySpawnEvent>,
+    window_query: Query<&Window>,
+) {
+    let random_screen_positions = {
+        || {
+            let window = window_query.single();
+            let mut rng = rand::thread_rng();
+            let width_units = ((window.width() / PLANT_GAP) / 2.0) as i32;
+            let height_units = ((window.height() / PLANT_GAP) / 2.0) as i32;
+
+            std::iter::repeat_with(move || {
+                let x = rng.gen_range(-width_units..width_units);
+                let y = rng.gen_range(-height_units..height_units);
+                (x, y)
+            })
+        }
+    };
+
+    random_screen_positions().take(10).for_each(|(x, y)| {
+        plant_events.send(PlantSpawnEvent { x, y });
+    });
+
+    random_screen_positions().take(5).for_each(|(x, y)| {
+        prey_events.send(PreySpawnEvent { x, y });
+    });
+}
+
+// --- PREY -------------------------------------------------------------------
+#[derive(Component, Debug, Reflect)]
+struct Prey;
+
+#[derive(Component, Debug, Reflect)]
+struct Motion {
+    direction: Vec2,
+    speed: f32,
+}
+
+#[derive(Component, Debug, Reflect)]
+enum Intent {
+    Wander,
+    SeekFood { target: Vec2 },
+    Flee { from: Vec2 },
+}
+
+#[derive(Event)]
+struct PreySpawnEvent {
+    x: i32,
+    y: i32,
+}
+
+fn create_prey(commands: &mut Commands, x: i32, y: i32) {
+    commands.spawn((
+        Prey,
+        Energy { value: 20.0 },
+        Position { x, y },
+        Motion {
+            direction: Vec2::ZERO,
+            speed: 50.0,
+        },
+        Vision {
+            visible_entities: Vec::new(),
+        },
+        Sprite {
+            color: Color::srgb(0.0, 0.0, 1.0),
+            custom_size: Some(Vec2::new(PLANT_SIZE * 1.2, PLANT_SIZE * 1.2)),
+            ..default()
+        },
+        Transform::from_xyz(x as f32 * PLANT_GAP, y as f32 * PLANT_GAP, 0.0),
+    ));
+}
+
+fn handle_prey_spawn(mut commands: Commands, mut event_reader: EventReader<PreySpawnEvent>) {
+    for event in event_reader.read() {
+        create_prey(&mut commands, event.x, event.y);
+    }
+}
+
+fn vision_system(
+    mut creatures: Query<(&Position, &mut Vision)>,
+    plants: Query<(Entity, &Position), With<Plant>>,
+) {
+    for (pos, mut vision) in creatures.iter_mut() {
+        vision.visible_entities.clear();
+
+        for (plant_entity, plant_pos) in plants.iter() {
+            let dx = pos.x - plant_pos.x;
+            let dy = pos.y - plant_pos.y;
+            if dx * dx + dy * dy < 25 {
+                // 5 unit vision radius
+                vision
+                    .visible_entities
+                    .push((plant_entity, EntityType::Food));
+            }
+        }
+    }
+}
+
+fn prey_decision_system(
+    mut commands: Commands,
+    query: Query<(Entity, &Vision), (With<Prey>, Without<Intent>)>,
+) {
+    for (entity, vision) in query.iter() {
+        if let Some((_, EntityType::Food)) = vision.visible_entities.first() {
+            commands.entity(entity).insert(Intent::Wander);
+        } else {
+            commands.entity(entity).insert(Intent::Wander);
+        }
+    }
+}
+
+fn movement_system(
+    mut query: Query<(&Intent, &mut Motion, &mut Transform, &mut Position)>,
+    time: Res<Time>,
+) {
+    let mut rng = rand::thread_rng();
+
+    for (intent, mut motion, mut transform, mut position) in query.iter_mut() {
+        match intent {
+            Intent::Wander => {
+                if rng.gen::<f32>() < 0.1 {
+                    let angle = rng.gen::<f32>() * std::f32::consts::TAU;
+                    motion.direction = Vec2::new(angle.cos(), angle.sin());
+                }
+            }
+            Intent::SeekFood { target: _ } => {
+                // Will implement later
+            }
+            Intent::Flee { from: _ } => {
+                // Will implement later
+            }
+        }
+
+        let movement = motion.direction * motion.speed * time.delta_secs();
+        transform.translation.x += movement.x;
+        transform.translation.y += movement.y;
+
+        position.x = (transform.translation.x / PLANT_GAP).round() as i32;
+        position.y = (transform.translation.y / PLANT_GAP).round() as i32;
+    }
 }
 
 // --- PLANTS -----------------------------------------------------------------
 #[derive(Component, Debug, Reflect)]
 struct Plant;
 
+#[derive(Event)]
+struct PlantSpawnEvent {
+    x: i32,
+    y: i32,
+}
+
+// Growth parameters.
 const GROWTH_CHANCE_PER_SECOND: f32 = 2.0; // Increased chance
-const CARDINAL_WEIGHT: f32 = 0.8; // 80% chance for cardinal directions
+const CARDINAL_WEIGHT: f32 = 0.9; // 80% chance for cardinal directions
+
+// Sizing.
 const PLANT_SIZE: f32 = 5.0;
 const PLANT_GAP: f32 = 6.0;
 
@@ -70,8 +245,16 @@ fn create_plant(commands: &mut Commands, x: i32, y: i32) {
     ));
 }
 
-// TODO(later): Plants should preference growing in straight lines (cardinal directions) based on neighboring plants.
-fn plant_growth(plants: Query<&Position, With<Plant>>, mut commands: Commands, time: Res<Time>) {
+fn handle_plant_spawn(mut commands: Commands, mut event_reader: EventReader<PlantSpawnEvent>) {
+    for event in event_reader.read() {
+        create_plant(&mut commands, event.x, event.y);
+    }
+}
+fn plant_growth(
+    plants: Query<&Position, With<Plant>>,
+    mut events: EventWriter<PlantSpawnEvent>,
+    time: Res<Time>,
+) {
     let mut rng = rand::thread_rng();
     let growth_chance = GROWTH_CHANCE_PER_SECOND * time.delta_secs();
 
@@ -84,13 +267,33 @@ fn plant_growth(plants: Query<&Position, With<Plant>>, mut commands: Commands, t
         if rng.gen::<f32>() < growth_chance {
             // Pick random direction with bias toward cardinal
             let (dx, dy) = if rng.gen::<f32>() < CARDINAL_WEIGHT {
-                // Cardinal directions
-                match rng.gen_range(0..4) {
-                    0 => (1, 0),
-                    1 => (-1, 0),
-                    2 => (0, 1),
-                    _ => (0, -1),
+                // Cardinal directions with line growth bias
+                let cardinal_dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+                let weighted_dirs: Vec<((i32, i32), f32)> = cardinal_dirs
+                    .iter()
+                    .map(|&(dx, dy)| {
+                        let weight =
+                            if plant_positions.contains(&(plant_pos.x - dx, plant_pos.y - dy)) {
+                                16.0
+                            } else {
+                                1.0
+                            };
+                        ((dx, dy), weight)
+                    })
+                    .collect();
+
+                let total_weight: f32 = weighted_dirs.iter().map(|(_, w)| w).sum();
+                let mut choice = rng.gen::<f32>() * total_weight;
+                let mut selected = cardinal_dirs[0];
+
+                for ((dx, dy), weight) in weighted_dirs {
+                    choice -= weight;
+                    if choice <= 0.0 {
+                        selected = (dx, dy);
+                        break;
+                    }
                 }
+                selected
             } else {
                 // Diagonal directions
                 match rng.gen_range(0..4) {
@@ -109,17 +312,7 @@ fn plant_growth(plants: Query<&Position, With<Plant>>, mut commands: Commands, t
                 continue;
             }
 
-            commands.spawn((
-                Plant,
-                Energy { value: 10.0 },
-                Position { x, y },
-                Sprite {
-                    color: Color::srgb(0.0, 1.0, 0.0),
-                    custom_size: Some(Vec2::new(PLANT_SIZE, PLANT_SIZE)),
-                    ..default()
-                },
-                Transform::from_xyz(x as f32 * PLANT_GAP, y as f32 * PLANT_GAP, 0.0),
-            ));
+            events.send(PlantSpawnEvent { x, y });
         }
     }
 }
