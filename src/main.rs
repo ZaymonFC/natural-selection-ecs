@@ -27,7 +27,7 @@ fn main() {
         .add_systems(Update, plant_growth.in_set(SimulationSet::Actions))
         .add_event::<PlantSpawnEvent>()
         .add_systems(Update, handle_plant_spawn)
-        // Prey systems
+        // Animal systems
         .add_event::<PreySpawnEvent>()
         .add_event::<IntentEvent>()
         .add_systems(Update, handle_prey_spawn)
@@ -38,6 +38,7 @@ fn main() {
                 animal_behaviour_system.in_set(SimulationSet::Decisions),
                 handle_intent_system.in_set(SimulationSet::Decisions),
                 movement_system.in_set(SimulationSet::Actions),
+                energy_drain_system.in_set(SimulationSet::Actions),
                 manage_breed_status.in_set(SimulationSet::Perception),
             ),
         )
@@ -339,6 +340,23 @@ fn handle_intent_system(
 // --- PHYSICAL SYSTEMS -------------------------------------------------------
 // - Add energy drain.
 
+fn energy_drain_system(
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Energy, &EntityKind)>,
+    time: Res<Time>,
+) {
+    const ENERGY_DRAIN_RATE: f32 = 5.0;
+
+    for (entity, mut energy, kind) in query.iter_mut() {
+        energy.value -= ENERGY_DRAIN_RATE * time.delta_secs();
+
+        if energy.value <= 0.0 {
+            println!("Entity {:?} of kind {:?} died of starvation", entity, kind);
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 #[derive(Event)]
 struct CollisionEvent(Entity, Entity); // (entity_a, entity_b)
 
@@ -361,18 +379,24 @@ fn check_collisions(
 fn handle_collisions(
     mut collisions: EventReader<CollisionEvent>,
     mut commands: Commands,
-    mut query: Query<(&EntityKind, &Diet, &Edible, &mut Energy, Option<&CanBreed>)>,
+    mut query: Query<(
+        &EntityKind,
+        &Diet,
+        Option<&mut Energy>,
+        &Edible,
+        Option<&CanBreed>,
+    )>,
     mut breed_events: EventWriter<BreedEvent>,
 ) {
     for CollisionEvent(entity_a, entity_b) in collisions.read() {
-        let (kind_a, diet_a, nutrition_a, can_breed_a) = if let Ok(a) = query.get(*entity_a) {
-            (a.0, a.1, a.2.nutrition, a.4)
+        let (kind_a, diet_a, _, nutrition_a, can_breed_a) = if let Ok(a) = query.get(*entity_a) {
+            (a.0, a.1, a.2, a.3.nutrition, a.4)
         } else {
             continue;
         };
 
-        let (kind_b, diet_b, nutrition_b, can_breed_b) = if let Ok(b) = query.get(*entity_b) {
-            (b.0, b.1, b.2.nutrition, b.4)
+        let (kind_b, diet_b, _, nutrition_b, can_breed_b) = if let Ok(b) = query.get(*entity_b) {
+            (b.0, b.1, b.2, b.3.nutrition, b.4)
         } else {
             continue;
         };
@@ -395,6 +419,34 @@ fn handle_collisions(
     }
 }
 
+fn eat(
+    commands: &mut Commands,
+    query: &mut Query<(
+        &EntityKind,
+        &Diet,
+        Option<&mut Energy>,
+        &Edible,
+        Option<&CanBreed>,
+    )>,
+    eater: Entity,
+    eaten: Entity,
+    nutrition: f32,
+) {
+    let eaten_exists = query.get(eaten).is_ok();
+    if eaten_exists {
+        if let Ok(components) = query.get_mut(eater) {
+            if let Some(mut energy) = components.2 {
+                println!(
+                    "Entity {:?} ate entity {:?} for {} energy",
+                    eater, eaten, nutrition
+                );
+                energy.value += nutrition;
+                commands.entity(eaten).despawn();
+            }
+        }
+    }
+}
+
 fn handle_breeding(
     mut commands: Commands,
     mut events: EventReader<BreedEvent>,
@@ -412,26 +464,6 @@ fn handle_breeding(
                 EntityKind::Predator => (), // TODO: Add predator creation.
                 _ => (),
             }
-        }
-    }
-}
-
-fn eat(
-    commands: &mut Commands,
-    query: &mut Query<(&EntityKind, &Diet, &Edible, &mut Energy, Option<&CanBreed>)>,
-    eater: Entity,
-    eaten: Entity,
-    nutrition: f32,
-) {
-    let eaten_exists = query.get(eaten).is_ok();
-    if eaten_exists {
-        if let Ok(mut eater_energy) = query.get_mut(eater) {
-            println!(
-                "Entity {:?} ate entity {:?} for {} energy",
-                eater, eaten, nutrition
-            );
-            eater_energy.3.value += nutrition;
-            commands.entity(eaten).despawn();
         }
     }
 }
@@ -499,7 +531,7 @@ struct PlantSpawnEvent {
 }
 
 // Growth parameters.
-const GROWTH_CHANCE_PER_SECOND: f32 = 1.4; // Increased chance
+const GROWTH_CHANCE_PER_SECOND: f32 = 3.0; // Increased chance
 const CARDINAL_WEIGHT: f32 = 0.9; // 80% chance for cardinal directions
 
 // Sizing.
@@ -510,7 +542,6 @@ const PLANT_GAP: f32 = 6.0;
 fn create_plant(commands: &mut Commands, x: i32, y: i32) {
     commands.spawn((
         Plant,
-        Energy { value: 10.0 },
         Position { x, y },
         Sprite {
             color: Color::srgb(0.0, 1.0, 0.0),
