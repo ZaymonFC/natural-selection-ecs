@@ -1,6 +1,14 @@
 use bevy::prelude::*;
 use rand::*;
 
+// Parameters I'm curious to see changing through natural selection:
+// - Gestation period
+// - Speed
+// - Vision range
+// - Field of view
+// - Energy efficiency (drain rate?)
+// etc. etc.
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -30,15 +38,18 @@ fn main() {
                 animal_behaviour_system.in_set(SimulationSet::Decisions),
                 handle_intent_system.in_set(SimulationSet::Decisions),
                 movement_system.in_set(SimulationSet::Actions),
+                manage_breed_status.in_set(SimulationSet::Perception),
             ),
         )
         // Add to main systems
         .add_event::<CollisionEvent>()
+        .add_event::<BreedEvent>()
         .add_systems(
             Update,
             (
                 check_collisions.in_set(SimulationSet::Perception),
                 handle_collisions.in_set(SimulationSet::Actions),
+                handle_breeding.in_set(SimulationSet::Actions),
             ),
         )
         .run();
@@ -62,6 +73,12 @@ struct Energy {
     value: f32,
 }
 
+#[derive(Component, Debug, Reflect)]
+struct BreedingThreshold(f32);
+
+#[derive(Component)]
+struct CanBreed;
+
 #[derive(Component, Debug, Reflect, Eq, PartialEq, Copy, Clone)]
 enum EntityKind {
     Plant,
@@ -78,6 +95,9 @@ struct Edible {
 struct Diet {
     eats: Vec<EntityKind>,
 }
+
+#[derive(Event)]
+struct BreedEvent(Entity, Entity);
 
 // --- SETUP ------------------------------------------------------------------
 fn setup_camera(mut commands: Commands) {
@@ -125,6 +145,7 @@ enum IntentEvent {
     Eat(Entity, Entity),    // (prey_entity, target_entity)
     Explore(Entity),        // prey_entity
     Escape(Entity, Entity), // (prey_entity, threat_entity)
+    Mate(Entity, Entity),   // (entity, target_mate)
 }
 
 #[derive(Component, Debug, Reflect)]
@@ -143,11 +164,32 @@ struct PreySpawnEvent {
     y: i32,
 }
 
+fn manage_breed_status(
+    mut commands: Commands,
+    query: Query<(Entity, &Energy, &BreedingThreshold), Without<CanBreed>>,
+    with_breed: Query<(Entity, &Energy, &BreedingThreshold), With<CanBreed>>,
+) {
+    // Add CanBreed when threshold crossed
+    for (entity, energy, threshold) in query.iter() {
+        if energy.value >= threshold.0 {
+            commands.entity(entity).insert(CanBreed);
+        }
+    }
+
+    // Remove CanBreed when energy drops below
+    for (entity, energy, threshold) in with_breed.iter() {
+        if energy.value < threshold.0 {
+            commands.entity(entity).remove::<CanBreed>();
+        }
+    }
+}
+
 fn create_prey(commands: &mut Commands, x: i32, y: i32) {
     commands.spawn((
         EntityKind::Prey,
         Behaves,
         Energy { value: 20.0 },
+        BreedingThreshold(30.0),
         Diet {
             eats: vec![EntityKind::Plant],
         },
@@ -185,20 +227,29 @@ struct Vision {
 }
 
 fn vision_system(
-    mut creatures: Query<(&Position, &mut Vision, &Diet)>,
-    entities: Query<(Entity, &Position, &EntityKind, Option<&Edible>)>,
+    mut creatures: Query<(&Position, &mut Vision, &Diet, &EntityKind)>,
+    entities: Query<(
+        Entity,
+        &Position,
+        &EntityKind,
+        Option<&Edible>,
+        Option<&Energy>,
+        Option<&CanBreed>,
+    )>,
 ) {
-    for (pos, mut vision, diet) in creatures.iter_mut() {
+    for (pos, mut vision, diet, self_kind) in creatures.iter_mut() {
         vision.visible_entities.clear();
 
-        for (entity, other_pos, kind, edible) in entities.iter() {
+        for (entity, other_pos, kind, edible, energy, can_breed) in entities.iter() {
             let dx = pos.x - other_pos.x;
             let dy = pos.y - other_pos.y;
             let dist_sq = dx * dx + dy * dy;
             let range_sq = (vision.range * vision.range) as i32;
 
             if dist_sq < range_sq {
-                if diet.eats.contains(kind) && edible.is_some() {
+                if diet.eats.contains(kind) && edible.is_some()
+                    || (kind == self_kind && can_breed.is_some() && energy.is_some())
+                {
                     vision
                         .visible_entities
                         .push((entity, *kind, (dist_sq as f32).sqrt()));
@@ -209,12 +260,27 @@ fn vision_system(
 }
 
 fn animal_behaviour_system(
-    query: Query<(Entity, &Vision, &Diet), With<Behaves>>,
+    query: Query<(Entity, &Vision, &Diet, &EntityKind, Option<&CanBreed>), With<Behaves>>,
     mut intent_events: EventWriter<IntentEvent>,
 ) {
-    for (entity, vision, diet) in query.iter() {
+    for (entity, vision, diet, kind, can_breed) in query.iter() {
         if !vision.visible_entities.is_empty() {
-            // Find closest food entity
+            // Only seek mates if we can breed
+            if can_breed.is_some() {
+                // Find closest potential mate
+                let closest_mate = vision
+                    .visible_entities
+                    .iter()
+                    .filter(|(_, k, _)| k == kind)
+                    .next();
+
+                if let Some((mate_entity, _, _)) = closest_mate {
+                    intent_events.send(IntentEvent::Mate(entity, *mate_entity));
+                    continue;
+                }
+            }
+
+            // Find closest food entity if not breeding
             let closest_food = vision
                 .visible_entities
                 .iter()
@@ -251,6 +317,11 @@ fn handle_intent_system(
                     *behavior = MotionBehavior::Evade { target: *threat };
                 }
             }
+            IntentEvent::Mate(entity, target) => {
+                if let Ok(mut behavior) = entities.get_mut(*entity) {
+                    *behavior = MotionBehavior::Seek { target: *target };
+                }
+            }
         }
     }
 }
@@ -280,19 +351,31 @@ fn check_collisions(
 fn handle_collisions(
     mut collisions: EventReader<CollisionEvent>,
     mut commands: Commands,
-    mut query: Query<(&EntityKind, &Diet, &Edible, &mut Energy)>,
+    mut query: Query<(&EntityKind, &Diet, &Edible, &mut Energy, Option<&CanBreed>)>,
+    mut breed_events: EventWriter<BreedEvent>,
 ) {
     for CollisionEvent(entity_a, entity_b) in collisions.read() {
-        let (nutrition_a, nutrition_b, can_a_eat_b, can_b_eat_a) =
-            match (query.get(*entity_a), query.get(*entity_b)) {
-                (Ok(a), Ok(b)) => (
-                    a.2.nutrition,
-                    b.2.nutrition,
-                    a.1.eats.contains(b.0),
-                    b.1.eats.contains(a.0),
-                ),
-                _ => continue,
-            };
+        let (kind_a, diet_a, nutrition_a, can_breed_a) = if let Ok(a) = query.get(*entity_a) {
+            (a.0, a.1, a.2.nutrition, a.4)
+        } else {
+            continue;
+        };
+
+        let (kind_b, diet_b, nutrition_b, can_breed_b) = if let Ok(b) = query.get(*entity_b) {
+            (b.0, b.1, b.2.nutrition, b.4)
+        } else {
+            continue;
+        };
+
+        // Check for breeding
+        if kind_a == kind_b && can_breed_a.is_some() && can_breed_b.is_some() {
+            breed_events.send(BreedEvent(*entity_a, *entity_b));
+            continue;
+        }
+
+        // Handle eating
+        let (can_a_eat_b, can_b_eat_a) =
+            (diet_a.eats.contains(kind_b), diet_b.eats.contains(kind_a));
 
         if can_a_eat_b {
             eat(&mut commands, &mut query, *entity_a, *entity_b, nutrition_b);
@@ -302,20 +385,44 @@ fn handle_collisions(
     }
 }
 
+fn handle_breeding(
+    mut commands: Commands,
+    mut events: EventReader<BreedEvent>,
+    mut query: Query<(&EntityKind, &Position, &mut Energy)>,
+) {
+    for BreedEvent(parent_a, parent_b) in events.read() {
+        if let Ok([(kind_a, pos_a, mut energy_a), (_, _, mut energy_b)]) =
+            query.get_many_mut([*parent_a, *parent_b])
+        {
+            energy_a.value -= 20.0;
+            energy_b.value -= 20.0;
+
+            match kind_a {
+                EntityKind::Prey => create_prey(&mut commands, pos_a.x, pos_a.y),
+                EntityKind::Predator => (), // TODO: Add predator creation.
+                _ => (),
+            }
+        }
+    }
+}
+
 fn eat(
     commands: &mut Commands,
-    query: &mut Query<(&EntityKind, &Diet, &Edible, &mut Energy)>,
+    query: &mut Query<(&EntityKind, &Diet, &Edible, &mut Energy, Option<&CanBreed>)>,
     eater: Entity,
     eaten: Entity,
     nutrition: f32,
 ) {
-    if let Ok(mut eater_energy) = query.get_mut(eater) {
-        println!(
-            "Entity {:?} ate entity {:?} for {} energy",
-            eater, eaten, nutrition
-        );
-        eater_energy.3.value += nutrition;
-        commands.entity(eaten).despawn();
+    let eaten_exists = query.get(eaten).is_ok();
+    if eaten_exists {
+        if let Ok(mut eater_energy) = query.get_mut(eater) {
+            println!(
+                "Entity {:?} ate entity {:?} for {} energy",
+                eater, eaten, nutrition
+            );
+            eater_energy.3.value += nutrition;
+            commands.entity(eaten).despawn();
+        }
     }
 }
 
