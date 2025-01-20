@@ -227,7 +227,7 @@ struct Vision {
 }
 
 fn vision_system(
-    mut creatures: Query<(&Position, &mut Vision, &Diet, &EntityKind)>,
+    mut creatures: Query<(Entity, &Position, &mut Vision, &Diet, &EntityKind)>,
     entities: Query<(
         Entity,
         &Position,
@@ -237,10 +237,14 @@ fn vision_system(
         Option<&CanBreed>,
     )>,
 ) {
-    for (pos, mut vision, diet, self_kind) in creatures.iter_mut() {
+    for (self_entity, pos, mut vision, diet, self_kind) in creatures.iter_mut() {
         vision.visible_entities.clear();
 
         for (entity, other_pos, kind, edible, energy, can_breed) in entities.iter() {
+            if entity == self_entity {
+                continue;
+            }
+
             let dx = pos.x - other_pos.x;
             let dy = pos.y - other_pos.y;
             let dist_sq = dx * dx + dy * dy;
@@ -256,6 +260,11 @@ fn vision_system(
                 }
             }
         }
+
+        // Sort by distance for consistent targeting.
+        vision
+            .visible_entities
+            .sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
     }
 }
 
@@ -265,29 +274,30 @@ fn animal_behaviour_system(
 ) {
     for (entity, vision, diet, kind, can_breed) in query.iter() {
         if !vision.visible_entities.is_empty() {
-            // Only seek mates if we can breed
-            if can_breed.is_some() {
-                // Find closest potential mate
-                let closest_mate = vision
-                    .visible_entities
-                    .iter()
-                    .filter(|(_, k, _)| k == kind)
-                    .next();
-
-                if let Some((mate_entity, _, _)) = closest_mate {
-                    intent_events.send(IntentEvent::Mate(entity, *mate_entity));
-                    continue;
-                }
-            }
-
-            // Find closest food entity if not breeding
-            let closest_food = vision
+            let has_available_mate = vision
                 .visible_entities
                 .iter()
-                .filter(|(_, kind, _)| diet.eats.contains(kind))
-                .next();
+                .find(|(_, k, _)| k == kind)
+                .is_some();
 
-            if let Some((food_entity, _, _)) = closest_food {
+            // Only seek mates if we can breed and there's a mate available
+            if can_breed.is_some() && has_available_mate {
+                let (mate_entity, _, _) = vision
+                    .visible_entities
+                    .iter()
+                    .find(|(_, k, _)| k == kind)
+                    .unwrap();
+
+                intent_events.send(IntentEvent::Mate(entity, *mate_entity));
+                continue;
+            }
+
+            // Look for food if not breeding
+            if let Some((food_entity, _, _)) = vision
+                .visible_entities
+                .iter()
+                .find(|(_, kind, _)| diet.eats.contains(kind))
+            {
                 intent_events.send(IntentEvent::Eat(entity, *food_entity));
                 continue;
             }
